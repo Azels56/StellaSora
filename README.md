@@ -1,6 +1,8 @@
 # Stella Sora Cheat
 
-by Azels56 — native IL2CPP menu for Stella Sora (Windows x64).
+native IL2CPP menu for Stella Sora (Windows x64).
+
+Use your brain to build or i'll release a file for this
 
 ## Layout
 
