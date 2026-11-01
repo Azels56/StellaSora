@@ -110,7 +110,7 @@ static int __cdecl hkLuaPCall(void* L, int nargs, int nres, int errf) {
 
 DWORD WINAPI LuaConsoleThread(LPVOID) {
     for (;;) {
-        const char* path = "C:\\Users\\Ejemm\\OneDrive\\Desktop\\Stella Sora\\work\\lua_run.lua";
+        const char* path = "lua_run.lua";
         static ULONGLONG lastDiag = 0;
         if (GetTickCount64() - lastDiag >= 10000) {
             lastDiag = GetTickCount64();
