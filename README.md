@@ -66,9 +66,10 @@ Press `INSERT` in game for the menu.
 
 ## Credits and disclaimer
 
-See the main [README](../../README.md) for full credits (Hiro420,
-Taiga74164, Aragon12UC, monoxgas, Dear ImGui, MinHook, Il2CppDumper, ILSpy) and the
-disclaimer.
+* Hiro420 — AceMetadataUnpacker (https://github.com/Hiro420/AceMetadataUnpacker) (ACE metadata extraction) Alot of things of his repo, Check it out especially of the nikke tools really helped out!
+* Taiga74164 — AP-MetadataDecryptor (https://github.com/Taiga74164/AP-MetadataDecryptor) (basis for the above).
+* Aragon12UC — IL2CPPUniversalSpeed (https://github.com/Aragon12UC/IL2CPPUniversalSpeed) (timeScale technique).
+
 
 Stella Sora and all of its original assets belong to Yostar Games; all credits go to
 their rightful owners. This is a fan-made educational project, not affiliated with or
