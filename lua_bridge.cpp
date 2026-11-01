@@ -86,7 +86,7 @@ void QueueDiag() {
         "if ok and pl then for i=0,pl.Count-1 do local a=pl[i]; local id=a and a.Id; if id and id>0 then "
         "local okc,cd=pcall(function() return CS.AdventureModuleHelper.GetPlayerSkillCd(id) end) P('cd'..id,tostring(okc)..':'..tostring(cd)) "
         "if okc and cd then P('energy'..id, tostring(pcall(function() return cd:GetEnergy() end))) P('total'..id, tostring(pcall(function() return cd:GetTotalEnergy() end))) end end end end "
-        "local okf,f=pcall(function() return io.open([[C:\\Users\\Ejemm\\OneDrive\\Desktop\\Stella Sora\\work\\arena_diag.txt]],'w') end) "
+        "local okf,f=pcall(function() return io.open([[arena_diag.txt]],'w') end) "
         "if okf and f then pcall(function() f:write(table.concat(out,'\\n')) f:close() end) end");
 }
 
