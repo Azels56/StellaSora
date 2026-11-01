@@ -25,10 +25,10 @@ static void DumpLuaChunk(const char* buff, size_t size, const char* name) {
     if (!buff || size == 0 || size > 64 * 1024 * 1024) return;
     return; // dumping disabled: file IO on the game thread caused load stalls
     if (!g_luaLockInit) return;
-    CreateDirectoryA("C:\\Users\\Ejemm\\OneDrive\\Desktop\\Stella Sora\\work\\lua_dump", nullptr);
+    CreateDirectoryA("lua_dump", nullptr); // fix
     char path[512];
     _snprintf_s(path, sizeof(path), _TRUNCATE,
-        "C:\\Users\\Ejemm\\OneDrive\\Desktop\\Stella Sora\\work\\lua_dump\\%05d_%.120s.luac",
+        "%05d_%.120s.luac",
         InterlockedIncrement((volatile LONG*)&g_luaChunks), (name && *name) ? name : "chunk");
     for (char* p = path; *p; ++p) { if (*p == ':' || *p == '?' || *p == '*' || *p == '"' || *p == '<' || *p == '>' || *p == '|' || *p == '/' || *p == '\n' || *p == '\r') *p = '_'; }
     FILE* f = nullptr;
