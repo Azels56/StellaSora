@@ -3,6 +3,7 @@
 #include "features.h"
 #include "lua_bridge.h"
 #include "il2cpp_api.h"
+#include "str_obf.h"
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
@@ -12,6 +13,7 @@
 #include <vector>
 #include <unordered_map>
 #include "imgui.h"
+#include "Menu.h"
 #include "backends/imgui_impl_win32.h"
 #include "backends/imgui_impl_dx11.h"
 #include "MinHook.h"
@@ -30,7 +32,10 @@ static ID3D11RenderTargetView* g_rtv = nullptr;
 static IDXGISwapChain* g_rtvSwap = nullptr;
 static UINT g_rtvW = 0, g_rtvH = 0;
 static bool g_imguiReady = false;
-static bool g_menuOpen = true;
+bool g_menuOpen = false;  // INSERT opens it; nothing is hooked until then
+volatile LONG g_overlayBooted = 0;
+ImFont* g_fontBold = nullptr;
+float g_wallAspect = 0.0f;
 using Present_t = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT);
 static Present_t g_origPresent = nullptr;
 using ResizeBuffers_t = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
@@ -38,42 +43,41 @@ static ResizeBuffers_t g_origResizeBuffers = nullptr;
 static int g_frame = 0;
 static std::string g_status = "attaching...";
 
+// The Present and ResizeBuffers detours are .text patches in d3d11/DXGI, and
+// the window subclass is an edit to the game's own window object. Both used to
+// be created and torn down around each menu session, which meant patching live
+// code while the game thread could be executing inside the detour — the crash
+// on close. They are now installed once at startup and left installed; the
+// overlay stays inert by returning straight through when nothing is drawn.
+static void* g_presentAddr = nullptr;
+static void* g_resizeAddr = nullptr;
+static HWND g_subclassHwnd = nullptr;
+
+static bool FloatersAlive();
+
 
 static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-    if (g_imguiReady) ImGui_ImplWin32_WndProcHandler(h, msg, wp, lp);
-    if (msg == WM_KEYDOWN) {
-        if (wp == VK_INSERT) { g_menuOpen = !g_menuOpen; return 0; }
-        if (wp == VK_F1) { g_cheat.god = !g_cheat.god; return 0; }
-        if (wp == VK_F2) { g_cheat.infEnergy = !g_cheat.infEnergy; return 0; }
-        if (wp == VK_F3) { g_cheat.dmgMult = g_cheat.dmgMult > 1 ? 1 : 10; return 0; }
-        if (wp == VK_F4) { g_cheat.aura = !g_cheat.aura; return 0; }
-        if (wp == VK_F6) { g_cheat.noCd = !g_cheat.noCd; return 0; }
-        if (wp == VK_F9) {
-            static const float gs[] = { 1.0f, 1.25f, 1.5f, 2.0f, 3.0f, 4.0f, 5.0f };
-            int cur = 0;
-            for (int i = 0; i < 7; i++) if (g_cheat.gameSpeed >= gs[i] - 0.01f) cur = i;
-            g_cheat.gameSpeed = gs[(cur + 1) % 7];
-            LogF("game speed %.2f", g_cheat.gameSpeed);
-            return 0;
-        }
-        if (wp == VK_F12) { QueueDiag(); return 0; }
-        if (wp == VK_F7) { g_cheat.unlimitedDash = !g_cheat.unlimitedDash; return 0; }
-        if (wp == VK_F8) {
-            static const float steps[] = { 1.0f, 1.2f, 1.5f, 2.0f, 3.0f, 5.0f };
-            int cur = 0;
-            for (int i = 0; i < 6; i++) if (g_cheat.moveSpdMult >= steps[i] - 0.01f) cur = i;
-            g_cheat.moveSpdMult = steps[(cur + 1) % 6];
-            LogF("move speed %.2f", g_cheat.moveSpdMult);
-            return 0;
-        }
-        if (wp == VK_F5) { ResetSkillsNow(); return 0; }
-    }
-    if (g_menuOpen) {
+    // The subclass now lives for the whole session, so everything inside is
+    // gated on the menu being on screen. An ungated handler would run for
+    // every game input and swallow clicks that belong to the game.
+    if (g_menuOpen && g_imguiReady) {
+        ImGui_ImplWin32_WndProcHandler(h, msg, wp, lp);
+        // Hotkeys are polled off GetAsyncKeyState instead of read here: this
+        // only runs while the menu is open, and INSERT has to work when it is
+        // closed. Doing both would toggle twice on a single press.
+        //
+        // Mouse and keyboard are gated on their own capture flags. Sharing the
+        // mouse flag for both meant typing in the Luau box also drove the
+        // character, and hovering the menu swallowed WASD even though ImGui
+        // never wanted the keyboard.
         switch (msg) {
         case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_RBUTTONDOWN: case WM_RBUTTONUP:
         case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MOUSEWHEEL:
-        case WM_KEYDOWN: case WM_KEYUP: case WM_CHAR:
             if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse) return 1;
+            break;
+        case WM_KEYDOWN: case WM_KEYUP: case WM_SYSKEYDOWN: case WM_SYSKEYUP:
+        case WM_CHAR:
+            if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureKeyboard) return 1;
             break;
         }
     }
@@ -112,55 +116,8 @@ static void CreateRTV(IDXGISwapChain* sc) {
 
 
 static void ApplyTheme() {
-    ImGuiStyle& st = ImGui::GetStyle();
-    st.WindowRounding = 8.0f;
-    st.ChildRounding = 6.0f;
-    st.FrameRounding = 5.0f;
-    st.GrabRounding = 5.0f;
-    st.TabRounding = 5.0f;
-    st.ScrollbarRounding = 8.0f;
-    st.WindowBorderSize = 1.0f;
-    st.FramePadding = ImVec2(10, 5);
-    st.ItemSpacing = ImVec2(10, 7);
-    st.CellPadding = ImVec2(6, 4);
-    st.WindowPadding = ImVec2(14, 12);
-    st.GrabMinSize = 12.0f;
-    ImVec4* c = st.Colors;
-    c[ImGuiCol_Text]                  = ImVec4(1.00f, 0.94f, 0.88f, 1.00f);
-    c[ImGuiCol_TextDisabled]          = ImVec4(0.78f, 0.55f, 0.44f, 1.00f);
-    c[ImGuiCol_WindowBg]              = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    c[ImGuiCol_ChildBg]               = ImVec4(0.09f, 0.025f, 0.015f, 0.60f);
-    c[ImGuiCol_PopupBg]               = ImVec4(0.10f, 0.03f, 0.02f, 0.98f);
-    c[ImGuiCol_Border]                = ImVec4(0.95f, 0.38f, 0.10f, 0.55f);
-    c[ImGuiCol_FrameBg]               = ImVec4(0.18f, 0.06f, 0.03f, 0.80f);
-    c[ImGuiCol_FrameBgHovered]        = ImVec4(0.35f, 0.11f, 0.05f, 0.90f);
-    c[ImGuiCol_FrameBgActive]         = ImVec4(0.50f, 0.16f, 0.06f, 1.00f);
-    c[ImGuiCol_TitleBg]               = ImVec4(0.12f, 0.03f, 0.02f, 0.85f);
-    c[ImGuiCol_TitleBgActive]         = ImVec4(0.22f, 0.06f, 0.03f, 0.95f);
-    c[ImGuiCol_Button]                = ImVec4(0.32f, 0.09f, 0.04f, 0.90f);
-    c[ImGuiCol_ButtonHovered]         = ImVec4(0.62f, 0.19f, 0.06f, 1.00f);
-    c[ImGuiCol_ButtonActive]          = ImVec4(0.85f, 0.30f, 0.08f, 1.00f);
-    c[ImGuiCol_Header]                = ImVec4(0.55f, 0.18f, 0.06f, 0.80f);
-    c[ImGuiCol_HeaderHovered]         = ImVec4(0.78f, 0.28f, 0.08f, 0.90f);
-    c[ImGuiCol_HeaderActive]          = ImVec4(0.95f, 0.38f, 0.10f, 1.00f);
-    c[ImGuiCol_Separator]             = ImVec4(0.95f, 0.40f, 0.12f, 0.45f);
-    c[ImGuiCol_SeparatorHovered]      = ImVec4(1.00f, 0.55f, 0.20f, 0.80f);
-    c[ImGuiCol_SeparatorActive]       = ImVec4(1.00f, 0.65f, 0.25f, 1.00f);
-    c[ImGuiCol_CheckMark]             = ImVec4(1.00f, 0.52f, 0.12f, 1.00f);
-    c[ImGuiCol_SliderGrab]            = ImVec4(0.95f, 0.35f, 0.10f, 1.00f);
-    c[ImGuiCol_SliderGrabActive]      = ImVec4(1.00f, 0.64f, 0.20f, 1.00f);
-    c[ImGuiCol_Tab]                   = ImVec4(0.20f, 0.06f, 0.03f, 0.85f);
-    c[ImGuiCol_TabHovered]            = ImVec4(0.75f, 0.25f, 0.08f, 1.00f);
-    c[ImGuiCol_TabSelected]           = ImVec4(0.66f, 0.20f, 0.06f, 1.00f);
-    c[ImGuiCol_TabSelectedOverline]   = ImVec4(1.00f, 0.62f, 0.18f, 1.00f);
-    c[ImGuiCol_TabDimmed]             = ImVec4(0.14f, 0.04f, 0.02f, 0.85f);
-    c[ImGuiCol_TabDimmedSelected]     = ImVec4(0.40f, 0.12f, 0.05f, 1.00f);
-    c[ImGuiCol_ScrollbarBg]           = ImVec4(0.06f, 0.02f, 0.01f, 0.60f);
-    c[ImGuiCol_ScrollbarGrab]         = ImVec4(0.55f, 0.18f, 0.06f, 0.90f);
-    c[ImGuiCol_ScrollbarGrabHovered]  = ImVec4(0.80f, 0.28f, 0.08f, 1.00f);
-    c[ImGuiCol_ScrollbarGrabActive]   = ImVec4(1.00f, 0.45f, 0.12f, 1.00f);
+    menu::ApplyTheme();
 }
-
 
 static ID3D11ShaderResourceView* g_wallTex = nullptr;
 static bool g_wallTried = false;
@@ -172,7 +129,7 @@ static bool LoadWallpaper(ID3D11Device* dev) {
     IWICImagingFactory* factory = nullptr;
     if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))) || !factory) return false;
     IWICBitmapDecoder* dec = nullptr;
-    const wchar_t* path = L"C:\\Users\\Ejemm\\OneDrive\\Desktop\\Stella Sora\\phoenix.jpg";
+    const wchar_t* path = L"C:\\Users\\Ejemm\\OneDrive\\Desktop\\Stella Sora\\Phoenix.jpg";
     bool ok = false;
     if (SUCCEEDED(factory->CreateDecoderFromFilename(path, nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec)) && dec) {
         IWICBitmapFrameDecode* frame = nullptr;
@@ -183,6 +140,7 @@ static bool LoadWallpaper(ID3D11Device* dev) {
                     UINT w = 0, h = 0;
                     conv->GetSize(&w, &h);
                     if (w && h) {
+                        g_wallAspect = (float)w / (float)h;
                         std::vector<uint8_t> px((size_t)w * h * 4);
                         if (SUCCEEDED(conv->CopyPixels(nullptr, w * 4, (UINT)px.size(), px.data()))) {
                             D3D11_TEXTURE2D_DESC td{};
@@ -211,211 +169,11 @@ static bool LoadWallpaper(ID3D11Device* dev) {
     return ok;
 }
 
-static void SectionHeader(const char* text) {
-    ImGui::Spacing();
-    ImGui::SeparatorText(text);
-}
-
-static void LabeledSliderInt(const char* label, int* v, int lo, int hi, const char* fmt) {
-    ImGui::TableNextRow();
-    ImGui::TableSetColumnIndex(0);
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(label);
-    ImGui::SetItemTooltip("%s", label);
-    ImGui::TableSetColumnIndex(1);
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    ImGui::PushID(label);
-    ImGui::SliderInt("##v", v, lo, hi, fmt);
-    ImGui::PopID();
-}
-
-static void LabeledSliderFloat(const char* label, float* v, float lo, float hi) {
-    ImGui::TableNextRow();
-    ImGui::TableSetColumnIndex(0);
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(label);
-    ImGui::SetItemTooltip("%s", label);
-    ImGui::TableSetColumnIndex(1);
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    ImGui::PushID(label);
-    ImGui::SliderFloat("##v", v, lo, hi, "%.1f");
-    ImGui::PopID();
-}
-
-static void SectionHeaderRow(const char* text) {
-    ImGui::TableNextRow();
-    ImGui::TableSetColumnIndex(0);
-    ImGui::Spacing();
-    ImGui::TextColored(ImVec4(1.00f, 0.55f, 0.15f, 1.00f), "%s", text);
-}
-
-static void CheckboxRow(const char* label, bool* v) {
-    ImGui::TableNextRow();
-    ImGui::TableSetColumnIndex(0);
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(label);
-    ImGui::SetItemTooltip("%s", label);
-    ImGui::TableSetColumnIndex(1);
-    ImGui::PushID(label);
-    ImGui::Checkbox("##c", v);
-    ImGui::PopID();
-}
-
-static bool AceLoaded() {
-    const char* names[] = { "ACE-Base64.dll", "ACE-Base.dll", "ACE-CORE.dll", "ACE-GuardClient.dll", "ACE-Service64.exe" };
-    for (const char* n : names) if (GetModuleHandleA(n)) return true;
-    return false;
-}
-
-static bool AceInstalled() {
-    return GetFileAttributesA("C:\\YostarGames\\StellaSora_EN\\AntiCheatExpert") != INVALID_FILE_ATTRIBUTES;
-}
-
-
 static void DrawMenu() {
-    if (g_cfgX >= 0) ImGui::SetNextWindowPos(ImVec2(g_cfgX, g_cfgY), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(g_cfgW, g_cfgH), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSizeConstraints(ImVec2(640, 360), ImVec2(1600, 1000));
-    ImGui::SetNextWindowBgAlpha(0.0f);
-    ImGui::Begin("Stella Sora Cheat", &g_menuOpen);
-    {
-        ImVec2 p0 = ImGui::GetWindowPos();
-        ImVec2 p1 = ImVec2(p0.x + ImGui::GetWindowSize().x, p0.y + ImGui::GetWindowSize().y);
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        if (g_wallTex) {
-            dl->AddImage((ImTextureID)(intptr_t)g_wallTex, p0, p1, ImVec2(0, 0), ImVec2(1, 1), IM_COL32(255, 255, 255, g_wallAlpha));
-        }
-        dl->AddRectFilled(p0, p1, g_wallTex ? IM_COL32(0, 0, 0, g_dimAlpha) : IM_COL32(12, 12, 16, 235));
-    }
-    ImGui::TextColored(ImVec4(1.00f, 0.48f, 0.12f, 1.00f), "Stella Sora Cheat");
-    ImGui::SameLine();
-    ImGui::TextDisabled("by Azels56   v2.0");
-    ImGui::TextDisabled("INSERT menu   F1 God   F2 Energy   F3 Damage   F4 Aura   F5 Reset   F6 No-CD   F7 Dash   F8 Move   F9 Game speed");
-    ImGui::Spacing();
-
-    if (ImGui::BeginTabBar("cheat_tabs", ImGuiTabBarFlags_None)) {
-        if (ImGui::BeginTabItem("Combat")) {
-            if (ImGui::BeginTable("combat", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_PadOuterX)) {
-                ImGui::TableSetupColumn("Setting", ImGuiTableColumnFlags_WidthStretch, 0.46f);
-                ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.54f);
-                SectionHeaderRow("Multipliers");
-                LabeledSliderInt("Damage", &g_cheat.dmgMult, 1, 100, "x%d");
-                LabeledSliderInt("Defense", &g_cheat.defMult, 1, 100, "x%d");
-                        LabeledSliderFloat("Game Speed", &g_cheat.gameSpeed, 1.0f, 5.0f);
-        LabeledSliderFloat("Attack Speed", &g_cheat.atkSpdMult, 1.0f, 2.0f);
-                LabeledSliderFloat("Move Speed", &g_cheat.moveSpdMult, 1.0f, 2.5f);
-                SectionHeaderRow("Player");
-                CheckboxRow("God Mode", &g_cheat.god);
-                CheckboxRow("Always Critical Hit", &g_cheat.alwaysCrit);
-                ImGui::EndTable();
-            }
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Skills")) {
-            if (ImGui::BeginTable("skills", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_PadOuterX)) {
-                ImGui::TableSetupColumn("Setting", ImGuiTableColumnFlags_WidthStretch, 0.46f);
-                ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.54f);
-                SectionHeaderRow("Cooldowns");
-                CheckboxRow("No Skill Cooldown", &g_cheat.noCd);
-                CheckboxRow("Unlimited Energy", &g_cheat.infEnergy);
-                CheckboxRow("Unlimited Dash", &g_cheat.unlimitedDash);
-                SectionHeaderRow("Kill Aura");
-                CheckboxRow("Kill Aura", &g_cheat.aura);
-                CheckboxRow("One-shot Aura", &g_cheat.auraLethal);
-                LabeledSliderInt("Aura Damage", &g_cheat.auraDmg, 10, 2000000000, "%d");
-                ImGui::EndTable();
-            }
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("State")) {
-            ImGui::TextColored(ImVec4(1.00f, 0.62f, 0.20f, 1.00f), "Live status");
-            ImGui::Separator();
-            ImGui::Text("Players %d", g_lastPlayers);
-            ImGui::Text("HP %lld / %lld   Alive %s", (long long)g_lastHp, (long long)g_lastMax, g_lastAlive ? "yes" : "no");
-            ImGui::Text("Energy %lld", (long long)g_lastEnergy);
-            ImGui::Text("Cooldown hook %s   Time scale %.2f", g_canUseCdFn ? "active" : "off", g_appliedTimeScale);
-            ImGui::Text("Run speed %.2f", g_dbgRunSpeed);
-            ImGui::Text("Aura %d hits   %lld -> %lld", g_auraHitsLast, (long long)g_auraHpBefore, (long long)g_auraHpAfter);
-            ImGui::Spacing();
-            ImGui::SeparatorText("Diagnostics");
-            ImGui::BeginChild("diag", ImVec2(0, 180), true);
-            {
-                FILE* f = nullptr;
-                if (fopen_s(&f, "C:\\Users\\Ejemm\\OneDrive\\Desktop\\Stella Sora\\work\\arena_diag.txt", "rb") == 0 && f) {
-                    char buf[2048]; size_t n = fread(buf, 1, sizeof(buf) - 1, f); buf[n] = 0; fclose(f);
-                    ImGui::TextUnformatted(buf);
-                } else {
-                    ImGui::TextUnformatted("no data yet");
-                }
-            }
-            ImGui::EndChild();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Safety")) {
-            if (ImGui::BeginTable("safety", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_PadOuterX)) {
-                ImGui::TableSetupColumn("Check", ImGuiTableColumnFlags_WidthStretch, 0.46f);
-                ImGui::TableSetupColumn("Result", ImGuiTableColumnFlags_WidthStretch, 0.54f);
-                SectionHeaderRow("Anti-cheat");
-                ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted("ACE base installed");
-                ImGui::TableSetColumnIndex(1); ImGui::TextColored(AceInstalled() ? ImVec4(1,0.6f,0.2f,1) : ImVec4(0.4f,1,0.4f,1), AceInstalled() ? "yes" : "no");
-                ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted("ACE module in game");
-                ImGui::TableSetColumnIndex(1); ImGui::TextColored(AceLoaded() ? ImVec4(1,0.6f,0.2f,1) : ImVec4(0.4f,1,0.4f,1), AceLoaded() ? "loaded" : "not loaded");
-                ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted("Inline code patch");
-                ImGui::TableSetColumnIndex(1); ImGui::TextColored(g_canUseCdFn ? ImVec4(1,0.4f,0.3f,1) : ImVec4(0.4f,1,0.4f,1), g_canUseCdFn ? "active" : "none");
-                SectionHeaderRow("Behaviour");
-                CheckboxRow("Safe mode (no code hooks, no GM commands)", &g_cheat.safeMode);
-                ImGui::EndTable();
-            }
-            ImGui::Spacing();
-            ImGui::TextWrapped("Safe mode keeps every change in managed data only: no inline patches and no GM orders. "
-                "Turn it off only if you need the stuck-enemy GM sweep.");
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Config")) {
-            if (ImGui::BeginTable("config", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_PadOuterX)) {
-                ImGui::TableSetupColumn("Setting", ImGuiTableColumnFlags_WidthStretch, 0.46f);
-                ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.54f);
-                SectionHeaderRow("Appearance");
-                LabeledSliderInt("Wallpaper opacity", &g_wallAlpha, 0, 255, "%d");
-                LabeledSliderInt("Backdrop darkness", &g_dimAlpha, 0, 255, "%d");
-                LabeledSliderFloat("UI scale", &g_fontScale, 0.8f, 1.6f);
-                ImGui::EndTable();
-            }
-            ImGui::Spacing();
-            if (ImGui::Button("Save config", ImVec2(140, 0))) { SaveConfig(); }
-            ImGui::SameLine();
-            if (ImGui::Button("Reload config", ImVec2(140, 0))) { LoadConfig(); }
-            ImGui::SameLine();
-            if (ImGui::Button("Defaults", ImVec2(110, 0))) {
-                g_wallAlpha = 150; g_dimAlpha = 145; g_fontScale = 1.0f;
-                g_cheat.dmgMult = 1; g_cheat.defMult = 1;
-                g_cheat.atkSpdMult = 1.0f; g_cheat.moveSpdMult = 1.0f; g_cheat.gameSpeed = 1.0f;
-                g_cheat.auraDmg = 5000; g_cheat.auraLethal = true;
-            }
-            ImGui::Spacing();
-            ImGui::TextDisabled("Config file:");
-            ImGui::TextWrapped("%s", CFG_PATH);
-            ImGui::EndTabItem();
-        }
-        ImGui::EndTabBar();
-    }
-
-    ImGui::Spacing();
-    if (ImGui::Button("Reset Skills", ImVec2(130, 0))) ResetSkillsNow();
-    ImGui::SameLine();
-    if (ImGui::Button("Reset Stats", ImVec2(120, 0))) ResetModifiers();
-    ImGui::SameLine();
-    if (ImGui::Button("Kill Mobs", ImVec2(120, 0))) KillMobs();
-
-    {
-        ImVec2 p = ImGui::GetWindowPos();
-        ImVec2 sz = ImGui::GetWindowSize();
-        g_cfgX = p.x; g_cfgY = p.y; g_cfgW = sz.x; g_cfgH = sz.y;
-        static ULONGLONG lastSave = 0;
-        ULONGLONG now = GetTickCount64();
-        if (now - lastSave >= 2000) { lastSave = now; SaveConfig(); }
-    }
-    ImGui::End();
+    menu::Draw((ImTextureID)(intptr_t)g_wallTex, g_wallAlpha, g_dimAlpha);
+    static ULONGLONG lastSave = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - lastSave >= 2000) { lastSave = now; SaveConfig(); }
 }
 
 static void RenderOverlay(IDXGISwapChain* sc) {
@@ -425,7 +183,10 @@ static void RenderOverlay(IDXGISwapChain* sc) {
         CreateRTV(sc);
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
-        ImGui::GetStyle().FontScaleMain = g_fontScale;
+        // Assigning FontScaleMain invalidates the font atlas, so only write it
+        // when the Settings slider actually moved.
+        if (ImGui::GetStyle().FontScaleMain != g_fontScale)
+            ImGui::GetStyle().FontScaleMain = g_fontScale;
         ImGui::NewFrame();
         if (g_menuOpen) DrawMenu();
         DrawFloaters(ImGui::GetForegroundDrawList(), ImGui::GetIO().DisplaySize);
@@ -453,6 +214,18 @@ static HRESULT __stdcall hkResizeBuffers(IDXGISwapChain* sc, UINT count, UINT wi
 }
 
 static HRESULT __stdcall hkPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
+    // First frame seen: the player has a swapchain, so its own startup path
+    // resolution is done and the loader list is stable.
+    InterlockedExchange(&g_overlayBooted, 1);
+
+    // Nothing on screen: skip the device query, the ImGui frame and the whole
+    // draw path. This is where the overlay spends almost all of its time, and
+    // it now costs two reads instead of a GetDevice round-trip. menu::Animating
+    // keeps the frame alive while the close fade is still running - skipping it
+    // froze the animation at full alpha and made the menu pop.
+    if (!g_menuOpen && !menu::Animating() && !FloatersAlive())
+        return g_origPresent(sc, sync, flags);
+
     ID3D11Device* dev = nullptr;
     if (FAILED(sc->GetDevice(__uuidof(ID3D11Device), (void**)&dev)) || !dev)
         return g_origPresent(sc, sync, flags);
@@ -462,6 +235,11 @@ static HRESULT __stdcall hkPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
     if (g_imguiReady && (dev != g_dev || sc != g_swap)) {
         if (g_rtv) { g_rtv->Release(); g_rtv = nullptr; }
         g_rtvSwap = nullptr;
+        // The wallpaper is a device resource. It dies with the old device, and
+        // g_wallTried would otherwise block the reload for the rest of the
+        // session, leaving the menu drawing a texture that no longer exists.
+        if (g_wallTex) { g_wallTex->Release(); g_wallTex = nullptr; }
+        g_wallTried = false;
         ImGui_ImplDX11_Shutdown();
         if (g_ctx) { g_ctx->Release(); g_ctx = nullptr; }
         if (g_dev) { g_dev->Release(); g_dev = nullptr; }
@@ -469,10 +247,16 @@ static HRESULT __stdcall hkPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
         dev = nullptr;
         g_swap = sc;
         g_dev->GetImmediateContext(&g_ctx);
-        if (g_ctx) ImGui_ImplDX11_Init(g_dev, g_ctx);
+        g_imguiReady = g_ctx && ImGui_ImplDX11_Init(g_dev, g_ctx);
     }
 
     if (!g_imguiReady) {
+        // A previous attempt can leave a device and context behind when the
+        // window was not found yet. Overwriting them without releasing pinned a
+        // device reference per frame, which blocks the swapchain from ever being
+        // destroyed.
+        if (g_ctx) { g_ctx->Release(); g_ctx = nullptr; }
+        if (g_dev) { g_dev->Release(); g_dev = nullptr; }
         g_dev = dev;
         dev = nullptr;
         if (g_dev) {
@@ -485,6 +269,8 @@ static HRESULT __stdcall hkPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
                 io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
                 if (GetFileAttributesA("C:\\Windows\\Fonts\\segoeui.ttf") != INVALID_FILE_ATTRIBUTES) {
                     io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 20.0f);
+                    if (GetFileAttributesA("C:\\Windows\\Fonts\\segoeuib.ttf") != INVALID_FILE_ATTRIBUTES)
+                        g_fontBold = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuib.ttf", 28.0f);
                 } else {
                     ImFontConfig fc;
                     fc.SizePixels = 20.0f;
@@ -493,13 +279,34 @@ static HRESULT __stdcall hkPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
                 ImGui::StyleColorsDark();
                 ApplyTheme();
                 ImGui_ImplWin32_Init(g_hwnd);
-                ImGui_ImplDX11_Init(g_dev, g_ctx);
-                g_origWndProc = (WNDPROC)SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)WndProc);
-                g_imguiReady = true;
+                // Only trust the backend once it actually initialised: marking
+                // ready on a failed init sends NewFrame into a dead renderer.
+                g_imguiReady = ImGui_ImplDX11_Init(g_dev, g_ctx);
             }
         }
     }
     if (dev) dev->Release();
+
+    // The subclass is installed once and then left alone. Dropping it on close
+    // and reinstalling on open raced the game thread's own window messages: a
+    // detach landing between SetWindowLongPtrA and the bookkeeping recorded our
+    // own proc as "the original", and the next subclass made WndProc call
+    // itself until the stack ran out. Re-check the live proc instead of
+    // trusting the cached handle, which also heals a window Unity rebuilt.
+    if (g_menuOpen && g_imguiReady) {
+        if (!g_hwnd || !IsWindow(g_hwnd)) {
+            g_hwnd = FindGameWindow();
+            g_subclassHwnd = nullptr;
+            g_origWndProc = nullptr;
+        }
+        if (g_hwnd) {
+            WNDPROC cur = (WNDPROC)GetWindowLongPtrA(g_hwnd, GWLP_WNDPROC);
+            if (cur != WndProc) {
+                g_origWndProc = (WNDPROC)SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)WndProc);
+                g_subclassHwnd = g_hwnd;
+            }
+        }
+    }
 
     if (g_imguiReady && g_ctx) {
         RenderOverlay(sc);
@@ -517,10 +324,19 @@ struct DmgFloater {
 };
 static DmgFloater g_floaters[64];
 static CRITICAL_SECTION g_fltLock;
-static bool g_fltInit = false;
+static INIT_ONCE g_fltOnce = INIT_ONCE_STATIC_INIT;
 
+static BOOL CALLBACK FloaterOnce(PINIT_ONCE, PVOID, PVOID*) {
+    InitializeCriticalSection(&g_fltLock);
+    return TRUE;
+}
+
+// ShowDamageNumber runs on the game thread and the draw path on the render
+// thread. The old lazy check let both enter the initialiser at once, which
+// handed one of them a critical section that was still being built.
+// InitOnceExecuteOnce makes every caller wait for the callback.
 static void FloaterInit() {
-    if (!g_fltInit) { InitializeCriticalSection(&g_fltLock); g_fltInit = true; }
+    InitOnceExecuteOnce(&g_fltOnce, FloaterOnce, nullptr, nullptr);
 }
 
 void ShowDamageNumber(void* target, long long dmg) {
@@ -575,7 +391,7 @@ void ShowDamageNumber(void* target, long long dmg) {
 }
 
 static void DrawFloaters(ImDrawList* dl, const ImVec2& display) {
-    if (!g_fltInit) return;
+    FloaterInit();
     ULONGLONG now = GetTickCount64();
     EnterCriticalSection(&g_fltLock);
     for (int i = 0; i < 64; i++) {
@@ -588,16 +404,109 @@ static void DrawFloaters(ImDrawList* dl, const ImVec2& display) {
 }
 
 
+// ---------------------------------------------------------- overlay lifetime
+// The detours stay enabled for the life of the process. Patching and
+// unpatching live code from the hotkey thread while the game thread could be
+// inside the detour is what crashed the process on menu close; the idle cost
+// is paid instead by the early-out at the top of hkPresent.
+static bool FloatersAlive() {
+    FloaterInit();
+    const ULONGLONG now = GetTickCount64();
+    bool any = false;
+    EnterCriticalSection(&g_fltLock);
+    for (int i = 0; i < 64; i++) if (g_floaters[i].until > now) { any = true; break; }
+    LeaveCriticalSection(&g_fltLock);
+    return any;
+}
+
+// One physical press, one action. Polled rather than read from the window
+// procedure because the subclass does not exist while the menu is closed.
+static bool KeyPressed(int vk) {
+    static bool down[256] = {};
+    const bool now = (GetAsyncKeyState(vk) & 0x8000) != 0;
+    const bool edge = now && !down[vk & 0xFF];
+    down[vk & 0xFF] = now;
+    return edge;
+}
+
+static void CycleSpeed(const float* steps, int n, float* target) {
+    int cur = 0;
+    for (int i = 0; i < n; i++) if (*target >= steps[i] - 0.01f) cur = i;
+    *target = steps[(cur + 1) % n];
+}
+
+DWORD WINAPI HotkeyThread(LPVOID) {
+    static const float kGameSpeed[] = { 1.0f, 1.25f, 1.5f, 2.0f, 3.0f, 4.0f, 5.0f };
+    static const float kMoveSpeed[] = { 1.0f, 1.2f, 1.5f, 2.0f, 3.0f, 5.0f };
+    ULONGLONG lastSave = GetTickCount64();
+    bool touched = false;
+
+    // A just-resumed process can report a key as already held, which would read
+    // as a press and open the menu on its own. Wait until the key is seen up
+    // once before trusting an edge — but give up after two seconds so a stuck
+    // report can never lock the menu out.
+    const ULONGLONG armedBy = GetTickCount64() + 2000;
+    bool armed = false;
+
+    for (;;) {
+        Sleep(16);
+
+        if (!armed) {
+            if (!(GetAsyncKeyState(VK_INSERT) & 0x8000)) {
+                armed = true;
+            } else if (GetTickCount64() > armedBy) {
+                // Still reading as held: consume the state so the release is
+                // what registers, and carry on rather than staying dark.
+                KeyPressed(VK_INSERT);
+                armed = true;
+            } else {
+                continue;
+            }
+        }
+
+        if (KeyPressed(VK_INSERT)) {
+            g_menuOpen = !g_menuOpen;
+            LogF("menu %s", g_menuOpen ? "open" : "closed");
+        }
+        if (KeyPressed(VK_F1)) { g_cheat.god = !g_cheat.god; touched = true; }
+        if (KeyPressed(VK_F2)) { g_cheat.infEnergy = !g_cheat.infEnergy; touched = true; }
+        if (KeyPressed(VK_F3)) { g_cheat.dmgMult = g_cheat.dmgMult > 1 ? 1 : 10; touched = true; }
+        if (KeyPressed(VK_F4)) { g_cheat.aura = !g_cheat.aura; touched = true; }
+        // Not ResetSkillsNow(): that walks the IL2CPP heap, and this is not the
+        // game thread. The action queue drains it inside the pcall hook, which
+        // is. Calling it here tripped Unity's "Collecting from unknown thread".
+        if (KeyPressed(VK_F5)) { QueueAction(ACT_RESET_SKILLS); touched = true; }
+        if (KeyPressed(VK_F6)) { g_cheat.noCd = !g_cheat.noCd; touched = true; }
+        if (KeyPressed(VK_F7)) { g_cheat.unlimitedDash = !g_cheat.unlimitedDash; touched = true; }
+        if (KeyPressed(VK_F8)) { CycleSpeed(kMoveSpeed, 6, &g_cheat.moveSpdMult); touched = true; }
+        if (KeyPressed(VK_F9)) { CycleSpeed(kGameSpeed, 7, &g_cheat.gameSpeed); touched = true; }
+
+        // While the menu is open it owns the periodic save; this thread only
+        // covers the closed case, so the two never write the file at once.
+        const ULONGLONG now = GetTickCount64();
+        if (!g_menuOpen && touched && now - lastSave >= 2000) {
+            lastSave = now; touched = false; SaveConfig();
+        }
+    }
+    return 0;
+}
+
+
 DWORD WINAPI InitThread(LPVOID) {
     while (!GetModuleHandleA("d3d11.dll")) Sleep(50);
     MH_Initialize();
+    // Masked like the other literals: a registered class name is readable with
+    // EnumWindows + GetClassName and would name the payload on sight.
+    static constexpr auto kDummyClass = OBF("SSDummyWnd");
+    const char* kClass = obf::Decoded(kDummyClass);
+
     WNDCLASSEXA wc{};
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = DefWindowProcA;
     wc.hInstance = GetModuleHandleA(nullptr);
-    wc.lpszClassName = "SSDummyWnd";
+    wc.lpszClassName = kClass;
     RegisterClassExA(&wc);
-    HWND dummy = CreateWindowExA(0, "SSDummyWnd", "", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, nullptr, nullptr, wc.hInstance, nullptr);
+    HWND dummy = CreateWindowExA(0, kClass, "", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, nullptr, nullptr, wc.hInstance, nullptr);
     DXGI_SWAP_CHAIN_DESC sd{};
     sd.BufferCount = 1;
     sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -616,16 +525,23 @@ DWORD WINAPI InitThread(LPVOID) {
         return 0;
     }
     void** vt = *(void***)sc;
-    void* present = vt[8];
-    void* resize = vt[13];
+    g_presentAddr = vt[8];
+    g_resizeAddr  = vt[13];
     sc->Release(); ctx->Release(); dev->Release(); DestroyWindow(dummy);
-    if (MH_CreateHook(present, (void*)&hkPresent, (void**)&g_origPresent) != MH_OK) {
+    UnregisterClassA(kClass, wc.hInstance);
+    if (MH_CreateHook(g_presentAddr, (void*)&hkPresent, (void**)&g_origPresent) != MH_OK) {
         g_status = "MH_CreateHook failed";
         return 0;
     }
-    MH_EnableHook(present);
-    if (MH_CreateHook(resize, (void*)&hkResizeBuffers, (void**)&g_origResizeBuffers) == MH_OK) {
-        MH_EnableHook(resize);
+    if (MH_CreateHook(g_resizeAddr, (void*)&hkResizeBuffers, (void**)&g_origResizeBuffers) != MH_OK) {
+        g_origResizeBuffers = nullptr;
+        g_resizeAddr = nullptr;
     }
+    // Enabled once, at startup, and never toggled again. hkPresent returns
+    // straight through to the original while nothing is on screen, so the
+    // overlay is inert without unpatching the game's own code mid-flight.
+    if (g_resizeAddr) MH_EnableHook(g_resizeAddr);
+    MH_EnableHook(g_presentAddr);
+    LogF("present hook armed");
     return 0;
 }
